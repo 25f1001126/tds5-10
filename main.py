@@ -1,6 +1,5 @@
 import uuid
-from datetime import datetime
-from fastapi import FastAPI, Request, Header, HTTPException, Response
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse
 from storage import TaskStore
 from agent import InvoiceAgentCore
@@ -20,18 +19,24 @@ def a2a_json_response(content: dict, status_code: int = 200) -> Response:
 async def protocol_and_auth_middleware(request: Request, call_next):
     path = request.url.path
 
-    # Allow public Agent Card discovery
+    # Public Agent Card discovery path check
     if path == "/.well-known/agent-card.json" and request.method == "GET":
         response = await call_next(request)
         response.headers["Content-Type"] = "application/json"
         return response
 
-    # Validate A2A-Version header
+    # Validate A2A-Version header strictly
     a2a_version = request.headers.get("A2A-Version")
-    if a2a_version and a2a_version != "1.0":
-        return a2a_json_response({"error": "Invalid or unsupported A2A-Version header. Expected '1.0'."}, status_code=400)
+    if not a2a_version or a2a_version != "1.0":
+        return a2a_json_response({"error": "Missing or invalid A2A-Version header. Expected '1.0'."}, status_code=400)
 
-    # Validate Bearer Token Authentication
+    # Validate Request Media Type for POST messages
+    if request.method == "POST" and "message" in path:
+        content_type = request.headers.get("Content-Type", "")
+        if "application/a2a+json" not in content_type and "application/json" not in content_type:
+            return a2a_json_response({"error": "Missing media type application/a2a+json"}, status_code=400)
+
+    # Authenticate Bearer token (strict user isolation)
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return a2a_json_response({"error": "Missing or invalid Bearer authentication token."}, status_code=401)
@@ -42,8 +47,6 @@ async def protocol_and_auth_middleware(request: Request, call_next):
     
     request.state.principal = token
     response = await call_next(request)
-    
-    # Force application/a2a+json for all A2A responses
     response.headers["Content-Type"] = "application/a2a+json"
     return response
 
@@ -55,9 +58,12 @@ async def get_agent_card(request: Request):
         "name": "Enterprise Invoice Action Agent",
         "description": "Autonomous A2A 1.0 agent analyzing invoice packages and orchestrating financial actions.",
         "version": "1.0.0",
+        "objectValuedCapabilities": True,
         "capabilities": {
             "batchProcessing": True,
-            "idempotencySupported": True
+            "idempotencySupported": True,
+            "streaming": False,
+            "pushNotifications": False
         },
         "supportedInterfaces": [
             {
@@ -96,7 +102,7 @@ async def send_message(request: Request):
 
     parts = message.get("parts", [])
     
-    # Check if this is a result continuation
+    # Check if this message is a result continuation
     is_result_continuation = False
     result_data = None
     for part in parts:
@@ -108,10 +114,13 @@ async def send_message(request: Request):
         task_id = message.get("taskId")
         task = store.get_task_by_id(principal, task_id)
         if not task:
-            return a2a_json_response({"error": "Task not found or unauthorized"}, status_code=404)
+            return a2a_json_response({"error": "Task not found or unauthorized"}, status_code=403)
         
+        # Guard against completed or canceled task state race conditions
         if task["status"]["state"] == "TASK_STATE_COMPLETED":
             return a2a_json_response({"task": task})
+        if task["status"]["state"] == "TASK_STATE_CANCELED":
+            return a2a_json_response({"error": "CONFLICT", "message": "Task is already canceled"}, status_code=409)
 
         proposals_artifact = next((p for p in task["artifacts"] if p["mediaType"] == "application/vnd.ga5.invoice-action-proposals+json"), None)
         if not proposals_artifact:
@@ -120,14 +129,12 @@ async def send_message(request: Request):
         stored_proposals = proposals_artifact["data"].get("proposals", [])
         incoming_results = result_data.get("results", [])
 
-        # Resilient matching supporting optional/missing actionId in results
         validated_executions = []
         for res in incoming_results:
             pkg_id = res.get("packageId")
             act_id = res.get("actionId")
             action_type = res.get("action")
 
-            # Try exact match first, then fallback to packageId + action type matching
             match = next((
                 p for p in stored_proposals 
                 if p["packageId"] == pkg_id and 
@@ -193,18 +200,19 @@ async def send_message(request: Request):
             ]
         }
 
-    try:
-        task, reused = store.save_task_idempotent(principal, message, create_new_task)
-        return a2a_json_response({"task": task})
-    except Exception as e:
-        return a2a_json_response({"error": "IDEMPOTENCY_CONFLICT", "details": str(e)}, status_code=409)
+    task, reused, conflict = store.save_task_idempotent(principal, message, create_new_task)
+    if conflict:
+        return a2a_json_response({"error": "IDEMPOTENCY_CONFLICT"}, status_code=409)
+        
+    return a2a_json_response({"task": task})
+
 
 @app.get("/a2a/tasks/{id}")
 async def get_task(id: str, request: Request):
     principal = request.state.principal
     task = store.get_task_by_id(principal, id)
     if not task:
-        return a2a_json_response({"error": "Task not found"}, status_code=404)
+        return a2a_json_response({"error": "Task not found"}, status_code=403)
     return a2a_json_response(task)
 
 
@@ -220,9 +228,10 @@ async def cancel_task(id: str, request: Request):
     principal = request.state.principal
     
     def apply_cancel(t):
-        if t["status"]["state"] == "TASK_STATE_COMPLETED":
+        current_state = t["status"]["state"]
+        if current_state == "TASK_STATE_COMPLETED":
             raise ValueError("Cannot cancel completed task")
-        if t["status"]["state"] == "TASK_STATE_CANCELED":
+        if current_state == "TASK_STATE_CANCELED":
             return t
         t["status"] = {"state": "TASK_STATE_CANCELED"}
         return t
@@ -230,7 +239,7 @@ async def cancel_task(id: str, request: Request):
     try:
         updated = store.update_task(principal, id, apply_cancel)
         if not updated:
-            return a2a_json_response({"error": "Task not found or unauthorized"}, status_code=404)
+            return a2a_json_response({"error": "Task not found or unauthorized"}, status_code=403)
         return a2a_json_response(updated)
     except ValueError as ve:
         return a2a_json_response({"error": "CONFLICT", "message": str(ve)}, status_code=409)
