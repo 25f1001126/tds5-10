@@ -6,11 +6,8 @@ from typing import Dict, Any, Optional, Tuple
 class TaskStore:
     def __init__(self):
         self._lock = threading.Lock()
-        # principal -> { task_id -> task_dict }
         self.tasks_by_user: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        # (principal, idempotency_hash) -> task_id
         self.idempotency_map: Dict[Tuple[str, str], str] = {}
-        # task_id -> principal
         self.task_owner: Dict[str, str] = {}
 
     @staticmethod
@@ -32,8 +29,10 @@ class TaskStore:
             user_tasks = self.tasks_by_user.get(principal, {})
             return list(user_tasks.values())
 
-    def save_task_idempotent(self, principal: str, message: dict, create_task_fn) -> Tuple[dict, bool]:
+    def save_task_idempotent(self, principal: str, message: dict, create_task_fn) -> Tuple[dict, bool, bool]:
         msg_hash = self.compute_message_hash(message)
+        message_id = message.get("messageId")
+        
         with self._lock:
             if principal not in self.tasks_by_user:
                 self.tasks_by_user[principal] = {}
@@ -41,16 +40,23 @@ class TaskStore:
             key = (principal, msg_hash)
             if key in self.idempotency_map:
                 existing_task_id = self.idempotency_map[key]
-                return self.tasks_by_user[principal][existing_task_id], True
+                return self.tasks_by_user[principal][existing_task_id], True, False
 
-            # Create new task via callback
+            # Check semantic content conflict for reused messageIds with different payload
+            for t_id, t_data in self.tasks_by_user[principal].items():
+                for hist_msg in t_data.get("history", []):
+                    if hist_msg.get("messageId") == message_id:
+                        existing_hash = self.compute_message_hash(hist_msg)
+                        if existing_hash != msg_hash:
+                            return None, False, True # Conflict (409 IDEMPOTENCY_CONFLICT)
+
             new_task = create_task_fn()
             task_id = new_task["id"]
             
             self.tasks_by_user[principal][task_id] = new_task
             self.idempotency_map[key] = task_id
             self.task_owner[task_id] = principal
-            return new_task, False
+            return new_task, False, False
 
     def update_task(self, principal: str, task_id: str, updater_fn) -> Optional[dict]:
         with self._lock:
