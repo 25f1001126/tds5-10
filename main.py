@@ -19,24 +19,24 @@ def a2a_json_response(content: dict, status_code: int = 200) -> Response:
 async def protocol_and_auth_middleware(request: Request, call_next):
     path = request.url.path
 
-    # Public Agent Card discovery path check
+    # Public Agent Card discovery bypasses auth & version requirements
     if path == "/.well-known/agent-card.json" and request.method == "GET":
         response = await call_next(request)
         response.headers["Content-Type"] = "application/json"
         return response
 
-    # Validate A2A-Version header strictly
+    # Validate A2A-Version header on all A2A control routes
     a2a_version = request.headers.get("A2A-Version")
     if not a2a_version or a2a_version != "1.0":
         return a2a_json_response({"error": "Missing or invalid A2A-Version header. Expected '1.0'."}, status_code=400)
 
-    # Validate Request Media Type for POST messages
-    if request.method == "POST" and "message" in path:
+    # Validate Request Media Type for POST payload content bodies
+    if request.method == "POST":
         content_type = request.headers.get("Content-Type", "")
         if "application/a2a+json" not in content_type and "application/json" not in content_type:
             return a2a_json_response({"error": "Missing media type application/a2a+json"}, status_code=400)
 
-    # Authenticate Bearer token (strict user isolation)
+    # Authenticate Bearer token for ALL other routes (including GET /tasks)
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return a2a_json_response({"error": "Missing or invalid Bearer authentication token."}, status_code=401)
@@ -58,12 +58,9 @@ async def get_agent_card(request: Request):
         "name": "Enterprise Invoice Action Agent",
         "description": "Autonomous A2A 1.0 agent analyzing invoice packages and orchestrating financial actions.",
         "version": "1.0.0",
-        "objectValuedCapabilities": True,
         "capabilities": {
             "batchProcessing": True,
-            "idempotencySupported": True,
-            "streaming": False,
-            "pushNotifications": False
+            "idempotencySupported": True
         },
         "supportedInterfaces": [
             {
@@ -102,7 +99,6 @@ async def send_message(request: Request):
 
     parts = message.get("parts", [])
     
-    # Check if this message is a result continuation
     is_result_continuation = False
     result_data = None
     for part in parts:
@@ -116,7 +112,6 @@ async def send_message(request: Request):
         if not task:
             return a2a_json_response({"error": "Task not found or unauthorized"}, status_code=403)
         
-        # Guard against completed or canceled task state race conditions
         if task["status"]["state"] == "TASK_STATE_COMPLETED":
             return a2a_json_response({"task": task})
         if task["status"]["state"] == "TASK_STATE_CANCELED":
