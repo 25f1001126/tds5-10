@@ -12,7 +12,6 @@ class TaskStore:
 
     @staticmethod
     def compute_message_hash(message: dict) -> str:
-        # Ignore configuration, normalize and hash message only recursively key-sorted
         clean_msg = {k: v for k, v in message.items() if k != "configuration"}
         canonical_str = json.dumps(clean_msg, sort_keys=True, separators=(',', ':'))
         return hashlib.sha256(canonical_str.encode('utf-8')).hexdigest()
@@ -42,7 +41,6 @@ class TaskStore:
                 existing_task_id = self.idempotency_map[key]
                 return self.tasks_by_user[principal][existing_task_id], True, False
 
-            # Check semantic content conflict for reused messageIds with different payload
             for t_id, t_data in self.tasks_by_user[principal].items():
                 for hist_msg in t_data.get("history", []):
                     if hist_msg.get("messageId") == message_id:
