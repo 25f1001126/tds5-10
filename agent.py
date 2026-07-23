@@ -27,7 +27,7 @@ Guidelines:
 
 Return a JSON object containing:
 1. "packageId": string
-2. "actionId": string (durable unique ID, at least 12 characters, e.g. "act-unique-id-9988")
+2. "actionId": string (durable unique ID, at least 12 characters)
 3. "action": one of the 5 exact action strings above
 4. "facts": object with "vendorName" (string), "invoiceNumber" (string), "amountMinor" (integer), "currency" (string)
 5. "evidenceRefs": array containing exactly the three decisive bracketed references from the paragraph that determines the action. Do not include cover-sheet references or decoys.
