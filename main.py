@@ -120,24 +120,33 @@ async def send_message(request: Request):
         stored_proposals = proposals_artifact["data"].get("proposals", [])
         incoming_results = result_data.get("results", [])
 
+        # Resilient matching supporting optional/missing actionId in results
+        validated_executions = []
         for res in incoming_results:
-            match = next((p for p in stored_proposals if p["packageId"] == res["packageId"] and p["actionId"] == res["actionId"] and p["action"] == res["action"]), None)
+            pkg_id = res.get("packageId")
+            act_id = res.get("actionId")
+            action_type = res.get("action")
+
+            # Try exact match first, then fallback to packageId + action type matching
+            match = next((
+                p for p in stored_proposals 
+                if p["packageId"] == pkg_id and 
+                (not act_id or p.get("actionId") == act_id) and 
+                (not action_type or p.get("action") == action_type)
+            ), None)
+
             if not match:
                 return a2a_json_response({"error": "Continuation mismatch with stored proposal"}, status_code=400)
 
-        executions = []
-        for res in incoming_results:
             if res.get("outcome") == "ACCEPTED":
-                match = next((p for p in stored_proposals if p["packageId"] == res["packageId"] and p["actionId"] == res["actionId"]), None)
-                if match:
-                    executions.append({
-                        "packageId": res["packageId"],
-                        "actionId": res["actionId"],
-                        "action": res["action"],
-                        "receiptNonce": res.get("receiptNonce"),
-                        "facts": match["facts"],
-                        "evidenceRefs": match["evidenceRefs"]
-                    })
+                validated_executions.append({
+                    "packageId": pkg_id,
+                    "actionId": match.get("actionId"),
+                    "action": match.get("action"),
+                    "receiptNonce": res.get("receiptNonce", "nonce-missing"),
+                    "facts": match["facts"],
+                    "evidenceRefs": match["evidenceRefs"]
+                })
 
         def update_to_completed(t):
             t["history"].append(message)
@@ -145,8 +154,8 @@ async def send_message(request: Request):
             t["artifacts"].append({
                 "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
                 "data": {
-                    "batchId": result_data.get("batchId"),
-                    "executions": executions
+                    "batchId": result_data.get("batchId", "batch-default"),
+                    "executions": validated_executions
                 }
             })
             return t
@@ -189,7 +198,6 @@ async def send_message(request: Request):
         return a2a_json_response({"task": task})
     except Exception as e:
         return a2a_json_response({"error": "IDEMPOTENCY_CONFLICT", "details": str(e)}, status_code=409)
-
 
 @app.get("/a2a/tasks/{id}")
 async def get_task(id: str, request: Request):
