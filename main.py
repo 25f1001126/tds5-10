@@ -2,9 +2,13 @@ import os
 import re
 import json
 import uuid
+import hashlib
 import sqlite3
 import threading
+import asyncio
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from groq import Groq
@@ -12,7 +16,7 @@ from groq import Groq
 app = FastAPI(title="A2A Invoice Agent", version="1.0.0")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # MUST be the exact URL you submit in the grading form, no trailing slash.
@@ -26,8 +30,7 @@ _lock = threading.Lock()
 
 # =========================================================================
 # Storage — SQLite-backed, guarded by a single process-wide lock.
-# Combined with --workers 1 this gives real atomicity for the whole
-# duration of a grading run.
+# Combined with --workers 1 this gives real atomicity for a grading run.
 # =========================================================================
 def _conn():
     c = sqlite3.connect(DB_PATH)
@@ -56,22 +59,9 @@ def list_tasks(principal):
         return [json.loads(r[0]) for r in rows]
 
 
-def save_task(principal, task):
-    c = _conn()
-    c.execute(
-        "INSERT INTO tasks (id, owner, data) VALUES (?, ?, ?) "
-        "ON CONFLICT(id) DO UPDATE SET data=excluded.data",
-        (task["id"], principal, json.dumps(task)),
-    )
-    c.commit()
-    c.close()
-
-
 def compute_message_hash(message):
     clean = {k: v for k, v in message.items() if k != "configuration"}
-    return __import__("hashlib").sha256(
-        json.dumps(clean, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(clean, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def save_task_idempotent(principal, message, create_task_fn):
@@ -96,10 +86,7 @@ def save_task_idempotent(principal, message, create_task_fn):
 
         new_task = create_task_fn()
         task_id = new_task["id"]
-        c.execute(
-            "INSERT INTO tasks (id, owner, data) VALUES (?, ?, ?)",
-            (task_id, principal, json.dumps(new_task)),
-        )
+        c.execute("INSERT INTO tasks (id, owner, data) VALUES (?, ?, ?)", (task_id, principal, json.dumps(new_task)))
         c.execute("INSERT OR REPLACE INTO idempotency (k, task_id) VALUES (?, ?)", (key, task_id))
         c.execute("INSERT OR REPLACE INTO msg_hash (k, hash) VALUES (?, ?)", (key_by_id, msg_hash))
         c.commit()
@@ -144,9 +131,7 @@ def decision_cache_set(fp, data):
 
 
 def content_hash(obj):
-    return __import__("hashlib").sha256(
-        json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 # =========================================================================
@@ -215,7 +200,6 @@ Package:
         if res.get("action") not in ACTIONS:
             res["action"] = "open_exception"
 
-        # Hard validation: strip any evidence ref the model invented that isn't in the text.
         cited = res.get("evidenceRefs") or []
         valid_cited = [r for r in cited if r in available_refs]
         if not valid_cited and available_refs:
@@ -237,30 +221,49 @@ Package:
         return fallback
 
 
+def _build_proposal(pkg, decision, fp):
+    pkg_id = pkg.get("packageId") or pkg.get("id")
+    action_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"a2a:{fp}"))
+    return {
+        "packageId": pkg_id,
+        "actionId": action_id,
+        "action": decision["action"],
+        "facts": {
+            "vendorName": decision.get("vendorName", ""),
+            "invoiceNumber": decision.get("invoiceNumber", ""),
+            "amountMinor": decision.get("amountMinor", 0),
+            "currency": decision.get("currency", "INR"),
+        },
+        "evidenceRefs": decision.get("evidenceRefs", []),
+        "rationale": decision.get("rationale", ""),
+    }
+
+
 def process_batch(packages):
-    proposals = []
-    for pkg in packages:
-        pkg_id = pkg.get("packageId") or pkg.get("id")
+    """Evaluates uncached packages concurrently via a thread pool so a
+    12-package batch doesn't serialize 12 sequential Groq round-trips."""
+    proposals = [None] * len(packages)
+    uncached_idx, uncached_pkgs = [], []
+
+    for idx, pkg in enumerate(packages):
         fp = content_hash(pkg)
         decision = decision_cache_get(fp)
-        if decision is None:
-            decision = evaluate_package(pkg)
-            decision_cache_set(fp, decision)
+        if decision is not None:
+            proposals[idx] = _build_proposal(pkg, decision, fp)
+        else:
+            uncached_idx.append(idx)
+            uncached_pkgs.append(pkg)
 
-        action_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"a2a:{fp}"))
-        proposals.append({
-            "packageId": pkg_id,
-            "actionId": action_id,
-            "action": decision["action"],
-            "facts": {
-                "vendorName": decision.get("vendorName", ""),
-                "invoiceNumber": decision.get("invoiceNumber", ""),
-                "amountMinor": decision.get("amountMinor", 0),
-                "currency": decision.get("currency", "INR"),
-            },
-            "evidenceRefs": decision.get("evidenceRefs", []),
-            "rationale": decision.get("rationale", ""),
-        })
+    if uncached_pkgs:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futures = {ex.submit(evaluate_package, pkg): (idx, pkg) for idx, pkg in zip(uncached_idx, uncached_pkgs)}
+            for fut in as_completed(futures):
+                idx, pkg = futures[fut]
+                decision = fut.result()
+                fp = content_hash(pkg)
+                decision_cache_set(fp, decision)
+                proposals[idx] = _build_proposal(pkg, decision, fp)
+
     return proposals
 
 
@@ -294,8 +297,7 @@ async def protocol_and_auth_middleware(request: Request, call_next):
     if a2a_version != "1.0":
         return a2a_response({"error": "Missing or invalid A2A-Version header. Expected '1.0'."}, 400)
 
-    # 3. THEN strict media type on POST bodies — reject anything that
-    #    isn't exactly application/a2a+json (no application/json fallback).
+    # 3. THEN strict media type on POST bodies.
     if request.method == "POST":
         content_type = request.headers.get("Content-Type", "")
         if "application/a2a+json" not in content_type:
@@ -333,78 +335,61 @@ async def get_agent_card():
     }
 
 
-@app.post("/a2a/message:send")
-async def send_message(request: Request):
-    principal = request.state.principal
-    try:
-        body = await request.json()
-    except Exception:
-        return a2a_response({"error": "malformed json"}, 400)
+def _handle_continuation(principal, message, result_part):
+    task_id = message.get("taskId")
+    context_id = message.get("contextId")
+    task = get_task(principal, task_id)
+    if not task or task.get("contextId") != context_id:
+        return a2a_response({"error": "Task not found or context mismatch"}, 404)
 
-    message = body.get("message", {}) or {}
-    message_id = message.get("messageId")
-    if not message_id:
-        return a2a_response({"error": "Missing messageId"}, 400)
-
-    parts = message.get("parts", []) or []
-    result_part = next(
-        (p for p in parts if p.get("mediaType") == "application/vnd.ga5.invoice-action-results+json"), None
+    result_data = result_part.get("data", {}) or {}
+    proposals_artifact = next(
+        (a for a in task["artifacts"] if a["mediaType"] == "application/vnd.ga5.invoice-action-proposals+json"),
+        None,
     )
+    if not proposals_artifact:
+        return a2a_response({"error": "No active proposal for continuation"}, 400)
+    stored_proposals = proposals_artifact["data"].get("proposals", [])
 
-    if result_part:
-        task_id = message.get("taskId")
-        context_id = message.get("contextId")
-        task = get_task(principal, task_id)
-        if not task or task.get("contextId") != context_id:
-            return a2a_response({"error": "Task not found or context mismatch"}, 404)
-
-        result_data = result_part.get("data", {}) or {}
-        proposals_artifact = next(
-            (a for a in task["artifacts"] if a["mediaType"] == "application/vnd.ga5.invoice-action-proposals+json"),
+    validated = []
+    for res in result_data.get("results", []):
+        pkg_id, act_id, action_type = res.get("packageId"), res.get("actionId"), res.get("action")
+        match = next(
+            (p for p in stored_proposals
+             if p["packageId"] == pkg_id and p.get("actionId") == act_id and p.get("action") == action_type),
             None,
         )
-        if not proposals_artifact:
-            return a2a_response({"error": "No active proposal for continuation"}, 400)
-        stored_proposals = proposals_artifact["data"].get("proposals", [])
-
-        validated = []
-        for res in result_data.get("results", []):
-            pkg_id, act_id, action_type = res.get("packageId"), res.get("actionId"), res.get("action")
-            match = next(
-                (p for p in stored_proposals
-                 if p["packageId"] == pkg_id and p.get("actionId") == act_id and p.get("action") == action_type),
-                None,
-            )
-            if not match:
-                return a2a_response({"error": "Continuation mismatch with stored proposal"}, 400)
-            if res.get("outcome") == "ACCEPTED":
-                validated.append({
-                    "packageId": pkg_id, "actionId": match["actionId"], "action": match["action"],
-                    "receiptNonce": res.get("receiptNonce"),
-                    "facts": match["facts"], "evidenceRefs": match["evidenceRefs"],
-                })
-
-        def complete(t):
-            # Atomic race guard: if a concurrent cancel already landed, refuse to complete.
-            if t["status"]["state"] == "TASK_STATE_CANCELED":
-                raise ValueError("CANCEL_ALREADY_APPLIED")
-            if t["status"]["state"] == "TASK_STATE_COMPLETED":
-                return t  # idempotent replay
-            t["history"].append(message)
-            t["status"] = {"state": "TASK_STATE_COMPLETED"}
-            t["artifacts"].append({
-                "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
-                "data": {"batchId": result_data.get("batchId"), "executions": validated},
+        if not match:
+            return a2a_response({"error": "Continuation mismatch with stored proposal"}, 400)
+        if res.get("outcome") == "ACCEPTED":
+            validated.append({
+                "packageId": pkg_id, "actionId": match["actionId"], "action": match["action"],
+                "receiptNonce": res.get("receiptNonce"),
+                "facts": match["facts"], "evidenceRefs": match["evidenceRefs"],
             })
-            return t
 
-        updated, err = update_task_atomic(principal, task_id, complete)
-        if err == "CANCEL_ALREADY_APPLIED":
-            return a2a_response({"error": "CONFLICT", "message": "Task already canceled"}, 409)
-        if err:
-            return a2a_response({"error": err}, 404)
-        return a2a_response({"task": updated})
+    def complete(t):
+        if t["status"]["state"] == "TASK_STATE_CANCELED":
+            raise ValueError("CANCEL_ALREADY_APPLIED")
+        if t["status"]["state"] == "TASK_STATE_COMPLETED":
+            return t  # idempotent replay
+        t["history"].append(message)
+        t["status"] = {"state": "TASK_STATE_COMPLETED"}
+        t["artifacts"].append({
+            "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
+            "data": {"batchId": result_data.get("batchId"), "executions": validated},
+        })
+        return t
 
+    updated, err = update_task_atomic(principal, task_id, complete)
+    if err == "CANCEL_ALREADY_APPLIED":
+        return a2a_response({"error": "CONFLICT", "message": "Task already canceled"}, 409)
+    if err:
+        return a2a_response({"error": err}, 404)
+    return a2a_response({"task": updated})
+
+
+def _handle_new_task(principal, message, parts):
     def create_new_task():
         task_id, context_id = f"task-{uuid.uuid4()}", f"ctx-{uuid.uuid4()}"
         batch_id, packages = "unknown-batch", []
@@ -430,9 +415,34 @@ async def send_message(request: Request):
     return a2a_response({"task": task})
 
 
+@app.post("/a2a/message:send")
+async def send_message(request: Request):
+    principal = request.state.principal
+    try:
+        body = await request.json()
+    except Exception:
+        return a2a_response({"error": "malformed json"}, 400)
+
+    message = body.get("message", {}) or {}
+    message_id = message.get("messageId")
+    if not message_id:
+        return a2a_response({"error": "Missing messageId"}, 400)
+
+    parts = message.get("parts", []) or []
+    result_part = next(
+        (p for p in parts if p.get("mediaType") == "application/vnd.ga5.invoice-action-results+json"), None
+    )
+
+    # Offload all blocking work (SQLite + Groq calls) to a thread so the
+    # event loop stays free to answer other concurrent grader requests.
+    if result_part:
+        return await asyncio.to_thread(_handle_continuation, principal, message, result_part)
+    return await asyncio.to_thread(_handle_new_task, principal, message, parts)
+
+
 @app.get("/a2a/tasks/{task_id}")
 async def get_task_route(task_id: str, request: Request):
-    task = get_task(request.state.principal, task_id)
+    task = await asyncio.to_thread(get_task, request.state.principal, task_id)
     if not task:
         return a2a_response({"error": "Task not found"}, 404)
     return a2a_response(task)
@@ -440,7 +450,8 @@ async def get_task_route(task_id: str, request: Request):
 
 @app.get("/a2a/tasks")
 async def list_tasks_route(request: Request):
-    return a2a_response({"tasks": list_tasks(request.state.principal)})
+    tasks = await asyncio.to_thread(list_tasks, request.state.principal)
+    return a2a_response({"tasks": tasks})
 
 
 @app.post("/a2a/tasks/{task_id}:cancel")
@@ -453,7 +464,7 @@ async def cancel_task_route(task_id: str, request: Request):
         t["status"] = {"state": "TASK_STATE_CANCELED"}
         return t
 
-    updated, err = update_task_atomic(request.state.principal, task_id, apply_cancel)
+    updated, err = await asyncio.to_thread(update_task_atomic, request.state.principal, task_id, apply_cancel)
     if err == "ALREADY_COMPLETED":
         return a2a_response({"error": "CONFLICT", "message": "Task already completed"}, 409)
     if err:
